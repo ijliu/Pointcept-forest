@@ -1,0 +1,11 @@
+data/
+work_dirs/
+
+# VS Code
+.vscode/
+
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
