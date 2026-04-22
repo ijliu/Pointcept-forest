@@ -79,7 +79,7 @@ param_dicts = [dict(keyword="block", lr=0.0006)]
 
 # dataset settings
 dataset_type = "Boreal3DDataset"
-data_root = "data/forest-all"
+data_root = "data/forinstance-subplots"
 
 data = dict(
     num_classes=4,

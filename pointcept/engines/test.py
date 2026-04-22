@@ -134,6 +134,8 @@ class SemSegTester(TesterBase):
 
         save_path = os.path.join(self.cfg.save_path, "result")
         make_dirs(save_path)
+
+        ############## start: 一些为特定数据集做的适配 ######################
         # create submit folder only on main process
         if (
             self.cfg.data.test.type == "ScanNetDataset"
@@ -163,8 +165,14 @@ class SemSegTester(TesterBase):
                 os.path.join(save_path, "submit", "test", "submission.json"), "w"
             ) as f:
                 json.dump(submission, f, indent=4)
+        
+        ############## end: 一些为特定数据集做的适配 ######################
+
+
         comm.synchronize()
         record = {}
+
+        ### 这里的代码逻辑是和测试数据集的构建逻辑相关 ###
         # fragment inference
         for idx, data_dict in enumerate(self.test_loader):
             start = time.time()
@@ -173,6 +181,9 @@ class SemSegTester(TesterBase):
             segment = data_dict.pop("segment")
             data_name = data_dict.pop("name")
             pred_save_path = os.path.join(save_path, "{}_pred.npy".format(data_name))
+
+            # 测试时需要注意！！！
+            # 如果已经有了预测文件，第二次测试不会生成新的文件
             if os.path.isfile(pred_save_path):
                 logger.info(
                     "{}/{}: {}, loaded pred and label.".format(
@@ -184,6 +195,8 @@ class SemSegTester(TesterBase):
                     segment = data_dict["origin_segment"]
             else:
                 pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
+                # 记录每个点被预测的次数
+                count = torch.zeros(pred.shape[0], device=pred.device)
                 for i in range(len(fragment_list)):
                     fragment_batch_size = 1
                     s_i, e_i = i * fragment_batch_size, min(
@@ -193,15 +206,20 @@ class SemSegTester(TesterBase):
                     for key in input_dict.keys():
                         if isinstance(input_dict[key], torch.Tensor):
                             input_dict[key] = input_dict[key].cuda(non_blocking=True)
+
                     idx_part = input_dict["index"]
                     with torch.no_grad():
                         pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
-                        pred_part = F.softmax(pred_part, -1)
+
+                        ### 这里先不进行 softmax ###
+                        # pred_part = F.softmax(pred_part, -1)
+
                         if self.cfg.empty_cache:
                             torch.cuda.empty_cache()
                         bs = 0
                         for be in input_dict["offset"]:
                             pred[idx_part[bs:be], :] += pred_part[bs:be]
+                            count[idx_part[bs:be]] += 1
                             bs = be
 
                     logger.info(
@@ -213,15 +231,32 @@ class SemSegTester(TesterBase):
                             batch_num=len(fragment_list),
                         )
                     )
+
+                ### 在这里先对每个类别的 logits 进行平均，然后进行softmax得到每个类别的概率
+                logits = pred / count.clamp_min(1).unsqueeze(1)   # 平均 logits
+                pred = F.softmax(logits, dim=-1)                  # 最终概率
+
+                save_dict = {
+                    "logits": logits.cpu().numpy().astype(np.float32),
+                    "count": count.cpu().numpy().astype(np.float32),
+                }
+            
+                ##### start: 对特定数据集的适配 end #####
                 if self.cfg.data.test.type == "ScanNetPPDataset":
                     pred = pred.topk(3, dim=1)[1].data.cpu().numpy()
-                else:
+                else:  ####### 正式的代码  #########
                     pred = pred.max(1)[1].data.cpu().numpy()
                 if "origin_segment" in data_dict.keys():
                     assert "inverse" in data_dict.keys()
                     pred = pred[data_dict["inverse"]]
                     segment = data_dict["origin_segment"]
-                np.save(pred_save_path, pred)
+
+                ### 这里需要保存后续可能需要的数据 ###
+                np.savez_compressed(pred_save_path, **save_dict)
+                # np.save(pred_save_path, pred)
+
+
+            ################ start: 对特定数据集进行适配 ###################
             if (
                 self.cfg.data.test.type == "ScanNetDataset"
                 or self.cfg.data.test.type == "ScanNet200Dataset"
@@ -272,6 +307,8 @@ class SemSegTester(TesterBase):
                         "{}_lidarseg.bin".format(data_name),
                     )
                 )
+            ################ end: 对特定数据集进行适配 ###################
+
 
             intersection, union, target = intersection_and_union(
                 pred, segment, self.cfg.data.num_classes, self.cfg.data.ignore_index
@@ -325,11 +362,13 @@ class SemSegTester(TesterBase):
             union = np.sum([meters["union"] for _, meters in record.items()], axis=0)
             target = np.sum([meters["target"] for _, meters in record.items()], axis=0)
 
+            ######### start: 对特定数据集的适配 ###########################
             if self.cfg.data.test.type == "S3DISDataset":
                 torch.save(
                     dict(intersection=intersection, union=union, target=target),
                     os.path.join(save_path, f"{self.test_loader.dataset.split}.pth"),
                 )
+            ######### end: 对特定数据集的适配 ###########################
 
             iou_class = intersection / (union + 1e-10)
             accuracy_class = intersection / (target + 1e-10)
